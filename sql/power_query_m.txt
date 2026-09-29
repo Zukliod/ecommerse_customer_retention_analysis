@@ -1,0 +1,99 @@
+// ==============================================================================
+// E-Commerce Customer Retention & Churn Diagnostic Suite
+// Script: sql/power_query_m.txt
+// Description: Turnkey Power Query (M) Transformation Scripts for Power BI Desktop
+// ==============================================================================
+
+// ------------------------------------------------------------------------------
+// QUERY 1: DimCustomers (Star Schema Dimension Table)
+// ------------------------------------------------------------------------------
+let
+    Source = Csv.Document(File.Contents("data/customers.csv"), [Delimiter=",", Columns=16, Encoding=65001, QuoteStyle=QuoteStyle.None]),
+    #"Promoted Headers" = Table.PromoteHeaders(Source, [PromoteAllScalars=true]),
+    #"Changed Type" = Table.TransformColumnTypes(#"Promoted Headers",{
+        {"customer_id", type text},
+        {"cohort_month", type text},
+        {"first_order_date", type date},
+        {"last_order_date", type date},
+        {"acquisition_channel", type text},
+        {"customer_segment", type text},
+        {"customer_city", type text},
+        {"customer_state", type text},
+        {"total_orders", Int64.Type},
+        {"total_spend", type number},
+        {"total_profit", type number},
+        {"avg_order_value", type number},
+        {"avg_discount_rate", type number},
+        {"avg_review_score", type number},
+        {"days_inactive", Int64.Type},
+        {"is_churned", Int64.Type}
+    }),
+    #"Added Status Label" = Table.AddColumn(#"Changed Type", "CustomerStatus", each if [is_churned] = 1 then "Churned" else "Active", type text),
+    #"Added LTV Tier" = Table.AddColumn(#"Added Status Label", "LTV_Tier", each 
+        if [total_spend] >= 300 then "Tier 1: High Value ($300+)"
+        else if [total_spend] >= 100 then "Tier 2: Mid Value ($100-$299)"
+        else "Tier 3: Low Value (<$100)", type text)
+in
+    #"Added LTV Tier"
+
+
+// ------------------------------------------------------------------------------
+// QUERY 2: FactOrders (Star Schema Fact Table)
+// ------------------------------------------------------------------------------
+let
+    Source = Csv.Document(File.Contents("data/orders.csv"), [Delimiter=",", Columns=18, Encoding=65001, QuoteStyle=QuoteStyle.None]),
+    #"Promoted Headers" = Table.PromoteHeaders(Source, [PromoteAllScalars=true]),
+    #"Changed Type" = Table.TransformColumnTypes(#"Promoted Headers",{
+        {"order_id", type text},
+        {"customer_id", type text},
+        {"order_date", type date},
+        {"product_category", type text},
+        {"items_count", Int64.Type},
+        {"order_value", type number},
+        {"freight_amount", type number},
+        {"discount_rate", type number},
+        {"discount_amount", type number},
+        {"net_amount", type number},
+        {"cogs", type number},
+        {"gross_profit", type number},
+        {"profit_margin", type number},
+        {"primary_payment_type", type text},
+        {"installments", Int64.Type},
+        {"delivery_days", type number},
+        {"is_late_delivery", Int64.Type},
+        {"review_score", type number}
+    }),
+    #"Added Year-Month" = Table.AddColumn(#"Changed Type", "OrderYearMonth", each Date.ToText([order_date], "yyyy-MM"), type text),
+    #"Added Discount Bracket" = Table.AddColumn(#"Added Year-Month", "DiscountBracket", each 
+        if [discount_rate] = 0 then "0% (Full Price)"
+        else if [discount_rate] <= 0.05 then "1% - 5%"
+        else if [discount_rate] <= 0.15 then "6% - 15%"
+        else if [discount_rate] <= 0.25 then "16% - 25%"
+        else "25%+ (High Promo)", type text)
+in
+    #"Added Discount Bracket"
+
+
+// ------------------------------------------------------------------------------
+// QUERY 3: FactCohortMatrix (Unpivoted Cohort Retention Table for Heatmaps)
+// ------------------------------------------------------------------------------
+let
+    Source = FactOrders,
+    #"Removed Other Columns" = Table.SelectColumns(Source, {"order_id", "customer_id", "order_date", "OrderYearMonth"}),
+    #"Merged Customers" = Table.NestedJoin(#"Removed Other Columns", {"customer_id"}, DimCustomers, {"customer_id"}, "DimCustomers", JoinKind.Inner),
+    #"Expanded DimCustomers" = Table.ExpandTableColumn(#"Merged Customers", "DimCustomers", {"cohort_month", "first_order_date"}, {"cohort_month", "first_order_date"}),
+    #"Added Order Year" = Table.AddColumn(#"Expanded DimCustomers", "OrderYear", each Date.Year([order_date]), Int64.Type),
+    #"Added Order Month Num" = Table.AddColumn(#"Added Order Year", "OrderMonthNum", each Date.Month([order_date]), Int64.Type),
+    #"Added Cohort Year" = Table.AddColumn(#"Added Order Month Num", "CohortYear", each Date.Year([first_order_date]), Int64.Type),
+    #"Added Cohort Month Num" = Table.AddColumn(#"Added Cohort Year", "CohortMonthNum", each Date.Month([first_order_date]), Int64.Type),
+    #"Added Cohort Index" = Table.AddColumn(#"Added Cohort Month Num", "CohortIndex", each ([OrderYear] - [CohortYear]) * 12 + ([OrderMonthNum] - [CohortMonthNum]), Int64.Type),
+    #"Filtered Valid Periods" = Table.SelectRows(#"Added Cohort Index", each [CohortIndex] >= 0 and [CohortIndex] <= 12),
+    #"Grouped Cohort Counts" = Table.Group(#"Filtered Valid Periods", {"cohort_month", "CohortIndex"}, {
+        {"ActiveCustomers", each Table.RowCount(Table.Distinct(Table.SelectColumns(_, {"customer_id"}))), Int64.Type}
+    }),
+    #"Merged Cohort Size" = Table.NestedJoin(#"Grouped Cohort Counts", {"cohort_month"}, 
+        Table.SelectRows(#"Grouped Cohort Counts", each [CohortIndex] = 0), {"cohort_month"}, "MonthZero", JoinKind.LeftOuter),
+    #"Expanded MonthZero" = Table.ExpandTableColumn(#"Merged Cohort Size", "MonthZero", {"ActiveCustomers"}, {"InitialCohortSize"}),
+    #"Added Retention Pct" = Table.AddColumn(#"Expanded MonthZero", "RetentionPercentage", each ([ActiveCustomers] / [InitialCohortSize]) * 100, type number)
+in
+    #"Added Retention Pct"
